@@ -82,6 +82,7 @@ impl Gaea2Server {
             Arc::new(AnalyzeBuildTool),
             Arc::new(AnalyzeTerrainTool),
             Arc::new(ExportUnrealTool),
+            Arc::new(PreviewTerrainTool),
             Arc::new(SetSaveDefinitionTool),
             Arc::new(PatchProjectTool),
             Arc::new(CalibrateNodesTool { refs }),
@@ -2823,6 +2824,139 @@ impl Tool for ExportUnrealTool {
         .map_err(MCPError::ToolExecutionFailed)?;
 
         ToolResult::json(&manifest)
+    }
+}
+
+// =============================================================================
+// Tool: preview_gaea2_terrain
+// =============================================================================
+
+/// The image itself, not a path to it: an agent tuning a graph has to see each build to judge
+/// it, and a path it cannot open is no use.
+struct PreviewTerrainTool;
+
+#[async_trait]
+impl Tool for PreviewTerrainTool {
+    fn name(&self) -> &str {
+        "preview_gaea2_terrain"
+    }
+
+    fn description(&self) -> &str {
+        "Render a built heightfield as a shaded-relief picture and return it as an image the \
+         caller can look at directly (also saved as a PNG next to the source, or at output_path). \
+         Use after every build to judge the terrain: craters, ridges and erosion read clearly in \
+         a hillshade, while the raw heightmap is a fog of greys."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Heightfield written by a build: 16-bit .png, .raw or .r16"
+                },
+                "metres_across": {
+                    "type": "number",
+                    "description": "Width of the map in metres; with metres_up it sets how steep \
+                                    slopes look",
+                    "default": 4800
+                },
+                "metres_up": {
+                    "type": "number",
+                    "description": "Metres between the lowest and highest sample",
+                    "default": 300
+                },
+                "azimuth_degrees": {
+                    "type": "number",
+                    "description": "Direction the light comes from, clockwise from north",
+                    "default": 315
+                },
+                "altitude_degrees": {
+                    "type": "number",
+                    "description": "Light height above the horizon; low light exaggerates relief",
+                    "default": 35
+                },
+                "max_size": {
+                    "type": "integer",
+                    "description": "Longest side of the picture in pixels",
+                    "default": 1024
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Where to save the PNG; defaults to <source>_hillshade.png"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'path'".to_string()))?
+            .to_string();
+        let number =
+            |key: &str, fallback: f64| args.get(key).and_then(Value::as_f64).unwrap_or(fallback);
+        let options = crate::preview::ShadeOptions {
+            metres_across: number("metres_across", 4800.0),
+            metres_up: number("metres_up", 300.0),
+            azimuth_degrees: number("azimuth_degrees", 315.0),
+            altitude_degrees: number("altitude_degrees", 35.0),
+            max_size: args
+                .get("max_size")
+                .and_then(Value::as_u64)
+                .unwrap_or(1024)
+                .clamp(64, 4096) as usize,
+        };
+        let output_path = args
+            .get("output_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let source = std::path::Path::new(&path);
+                let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+                source.with_file_name(format!("{stem}_hillshade.png"))
+            });
+
+        let source = path.clone();
+        let (png, size, flat) = tokio::task::spawn_blocking(move || {
+            let field = crate::terrain::load(std::path::Path::new(&source))?;
+            let flat = field.raw_max <= field.raw_min;
+            let (png, size) = crate::preview::render(&field, &options)?;
+            Ok::<_, String>((png, size, flat))
+        })
+        .await
+        .map_err(|e| MCPError::Internal(format!("Preview task failed: {e}")))?
+        .map_err(MCPError::InvalidParameters)?;
+
+        tokio::fs::write(&output_path, &png)
+            .await
+            .map_err(|e| MCPError::ToolExecutionFailed(format!("Cannot write the preview: {e}")))?;
+
+        let summary = json!({
+            "source": path,
+            "preview_path": output_path.to_string_lossy(),
+            "preview_size": size,
+            "is_flat": flat,
+            "note": if flat {
+                "The heightfield is flat: the graph produced no relief, so the picture is one grey"
+            } else {
+                "Light from the north-west by default; slopes facing it are bright"
+            },
+        });
+
+        Ok(ToolResult {
+            content: vec![
+                Content::Image {
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+                    mime_type: "image/png".to_string(),
+                },
+                Content::json(&summary)?,
+            ],
+            is_error: false,
+        })
     }
 }
 

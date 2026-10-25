@@ -27,6 +27,7 @@ mod config;
 #[rustfmt::skip]
 mod gaea_schema_generated;
 mod generation;
+mod preview;
 mod schema;
 mod server;
 mod templates;
