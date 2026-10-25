@@ -83,6 +83,7 @@ impl Gaea2Server {
             Arc::new(AnalyzeTerrainTool),
             Arc::new(ExportUnrealTool),
             Arc::new(PreviewTerrainTool),
+            Arc::new(PlanetSurfaceTool { refs: refs.clone() }),
             Arc::new(SetSaveDefinitionTool),
             Arc::new(PatchProjectTool),
             Arc::new(CalibrateNodesTool { refs }),
@@ -2957,6 +2958,158 @@ impl Tool for PreviewTerrainTool {
             ],
             is_error: false,
         })
+    }
+}
+
+// =============================================================================
+// Tool: create_gaea2_planet_surface
+// =============================================================================
+
+/// The Moon and Mars, which none of the Earth templates come close to.
+struct PlanetSurfaceTool {
+    refs: ServerRefs,
+}
+
+#[async_trait]
+impl Tool for PlanetSurfaceTool {
+    fn name(&self) -> &str {
+        "create_gaea2_planet_surface"
+    }
+
+    fn description(&self) -> &str {
+        "Create a Moon or Mars surface project: a rolling base (or a real elevation model through \
+         a File node), large and small crater fields, an optional hero crater, micrometeorite \
+         pitting, layered rock on Mars, and slow mass wasting. It saves Height plus the masks a \
+         landscape and PCG need - Slope, CraterRims, Wear, Deposits - as 16-bit PNGs, and opens \
+         in Gaea with the Height node selected. Build it with run_gaea2_project, look at it with \
+         preview_gaea2_terrain, then hand it to export_gaea2_for_unreal."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "project_name": {"type": "string", "description": "Name of the project file"},
+                "body": {"type": "string", "enum": ["moon", "mars"]},
+                "seed": {"type": "integer", "default": 1},
+                "input_heightmap": {
+                    "type": "string",
+                    "description": "Optional 16-bit heightmap (e.g. a NASA DTM converted with \
+                                    GDAL) to build on instead of the procedural base. Craters \
+                                    are then added gently so the measured relief survives, and \
+                                    Height is not stretched"
+                },
+                "input_height_range_m": {
+                    "type": "number",
+                    "description": "Metres between the lowest and highest sample of \
+                                    input_heightmap; reported back for the Unreal scale"
+                },
+                "crater_density": {"type": "number", "default": 1.0, "description": "0..2"},
+                "crater_depth": {"type": "number", "default": 1.0, "description": "0..2"},
+                "hero_crater": {"type": "boolean", "default": true},
+                "resolution": {
+                    "type": "integer",
+                    "description": "Build resolution, a power of two from 256 to 8192",
+                    "default": 4096
+                },
+                "output_path": {"type": "string", "description": "Where to write the .terrain"}
+            },
+            "required": ["project_name", "body"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let project_name = args
+            .get("project_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'project_name'".to_string()))?;
+        let body = args
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(crate::planet::Body::parse)
+            .ok_or_else(|| MCPError::InvalidParameters("'body' must be moon or mars".to_string()))?;
+        let resolution = args.get("resolution").and_then(Value::as_i64).unwrap_or(4096);
+        if !(256..=8192).contains(&resolution) || (resolution & (resolution - 1)) != 0 {
+            return Err(MCPError::InvalidParameters(format!(
+                "resolution must be a power of two from 256 to 8192, not {resolution}"
+            )));
+        }
+        let input = args
+            .get("input_heightmap")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(path) = &input {
+            if !std::path::Path::new(path).exists() {
+                return Err(MCPError::InvalidParameters(format!(
+                    "input_heightmap not found: {path}"
+                )));
+            }
+        }
+
+        let params = crate::planet::PlanetParams {
+            body,
+            seed: args.get("seed").and_then(Value::as_i64).unwrap_or(1),
+            input_heightmap: input.clone(),
+            crater_density: args.get("crater_density").and_then(Value::as_f64).unwrap_or(1.0),
+            crater_depth: args.get("crater_depth").and_then(Value::as_f64).unwrap_or(1.0),
+            hero_crater: args.get("hero_crater").and_then(Value::as_bool).unwrap_or(true),
+        };
+        let workflow = crate::planet::build_workflow(&params);
+
+        let output_path = args
+            .get("output_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.refs.config.generate_output_path(project_name));
+        let output_str = output_path.to_string_lossy().to_string();
+        let build_config = BuildConfig {
+            resolution: resolution as i32,
+            ..Default::default()
+        };
+        generate_project(project_name, &workflow, Some(build_config), Some(&output_str))
+            .await
+            .map_err(MCPError::ToolExecutionFailed)?;
+
+        // Gaea draws only the selected node; a project saved with none selected opens as a flat
+        // grey plane, which reads as a broken graph.
+        let (mut project, _) = open_project(&output_path, false).await?;
+        if let Some(state) = terrain_asset_mut(&mut project)
+            .and_then(|asset| asset.get_mut("State"))
+            .and_then(Value::as_object_mut)
+        {
+            state.insert(
+                "SelectedNode".to_string(),
+                json!(crate::planet::ids::HEIGHT),
+            );
+        }
+        save_project(&output_path, &project).await?;
+
+        let outputs: Vec<Value> = crate::planet::OUTPUTS
+            .iter()
+            // Gaea appends the port to the file name: Height is written as Height_Out.png.
+            .map(|(name, id)| json!({"name": name, "node_id": id, "file": format!("{name}_Out.png")}))
+            .collect();
+        ToolResult::json(&json!({
+            "success": true,
+            "project_path": output_str,
+            "body": format!("{body:?}"),
+            "input_heightmap": input,
+            "input_height_range_m": args.get("input_height_range_m"),
+            "resolution": resolution,
+            "outputs": outputs,
+            "next": [
+                "run_gaea2_project on project_path",
+                "preview_gaea2_terrain on the Height output",
+                "export_gaea2_for_unreal with Slope, CraterRims, Wear and Deposits as masks"
+            ],
+            "height_note": if input.is_some() {
+                "Height keeps the input's range, so input_height_range_m (plus a little for the \
+                 added craters) is the height range to give export_gaea2_for_unreal"
+            } else {
+                "Height is stretched to the full 16-bit range: choose the height range in metres \
+                 when exporting (a few hundred metres suits an 8 km Moon or Mars map)"
+            },
+        }))
     }
 }
 
