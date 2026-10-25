@@ -2570,8 +2570,8 @@ impl Tool for ExportUnrealTool {
          resamples to a size Unreal accepts (8129, 8161, 4033...; nearest valid size by default), \
          writes 16-bit PNG and/or .r16 heightmaps, 8-bit layer masks at the same size, optional \
          tiles named _x0_y0 for tiled import, and unreal_import.json with the landscape scale \
-         (XY cm per vertex, Z for the height range, actor Z that puts the lowest point at 0) and \
-         the component layouts that match."
+         (XY cm per vertex; Z equal to XY by default, or fitted to the height range; actor Z that \
+         puts the lowest point at 0) and the component layouts that match."
     }
 
     fn schema(&self) -> Value {
@@ -2610,6 +2610,15 @@ impl Tool for ExportUnrealTool {
                     "description": "Split into N x N tiles that share edges (for World Partition \
                                     tiled import); 1 writes a single file",
                     "default": 1
+                },
+                "uniform_scale": {
+                    "type": "boolean",
+                    "description": "Use the X/Y scale for Z too, and write the heights into the \
+                                    part of the 16-bit range that scale needs. Nanite \
+                                    displacement on a landscape goes sideways on slopes when \
+                                    the scale is non-uniform (UE-367789). false fits Z to the \
+                                    height range instead, for the finest height steps",
+                    "default": true
                 },
                 "format": {
                     "type": "string",
@@ -2666,6 +2675,10 @@ impl Tool for ExportUnrealTool {
             .unwrap_or(1)
             .max(1) as usize;
         let requested = args.get("target_size").and_then(Value::as_u64).map(|v| v as usize);
+        let uniform = args
+            .get("uniform_scale")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let masks: Vec<(String, String, bool)> = args
             .get("masks")
             .and_then(Value::as_array)
@@ -2705,10 +2718,21 @@ impl Tool for ExportUnrealTool {
                     nearest_valid_size(target)
                 ));
             }
+            let scale = if uniform {
+                landscape_scale_uniform(target, world_m, height_m)?
+            } else {
+                landscape_scale(target, world_m, height_m)
+            };
             std::fs::create_dir_all(&output_dir)
                 .map_err(|e| format!("Cannot create {}: {e}", output_dir.display()))?;
 
-            let height = resample(&field.samples, field.size, target);
+            let mut height = resample(&field.samples, field.size, target);
+            if uniform {
+                let fraction = height_fraction(scale.z, height_m);
+                for h in &mut height {
+                    *h *= fraction;
+                }
+            }
             let mut heightmaps = Vec::new();
             if format != "r16" {
                 heightmaps.extend(write_field(
@@ -2758,7 +2782,6 @@ impl Tool for ExportUnrealTool {
                 });
             }
 
-            let scale = landscape_scale(target, world_m, height_m);
             let mut notes = vec![
                 format!(
                     "Landscape mode > Import from File: pick the heightmap, set Section Size {} \
@@ -2774,6 +2797,22 @@ impl Tool for ExportUnrealTool {
                 ),
                 "Import each mask as the weight of the paint layer it is named after.".to_string(),
             ];
+            if uniform {
+                notes.push(format!(
+                    "Uniform scale (Z = X/Y), so Nanite displacement follows the real surface \
+                     normal on slopes (UE-367789). The heights use {:.1}% of the 16-bit range, \
+                     in steps of {:.2} cm.",
+                    height_fraction(scale.z, height_m) * 100.0,
+                    scale.z / 128.0
+                ));
+            } else {
+                notes.push(
+                    "Non-uniform scale: fine without displacement, but Nanite displacement goes \
+                     sideways on slopes with it (UE-367789). Export with \"uniform_scale\": true \
+                     for a displaced landscape."
+                        .to_string(),
+                );
+            }
             if field.size != target {
                 notes.push(format!(
                     "Resampled from {} to {}: the build size is a power of two, which Unreal \
@@ -2807,6 +2846,7 @@ impl Tool for ExportUnrealTool {
                 metres_per_vertex: world_m / (target - 1) as f64,
                 layouts,
                 scale,
+                uniform_scale: uniform,
                 tiles_per_side: tiles,
                 heightmaps,
                 masks: mask_exports,
