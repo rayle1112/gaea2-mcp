@@ -197,6 +197,35 @@ pub fn landscape_scale(size: usize, world_m: f64, height_m: f64) -> LandscapeSca
     }
 }
 
+/// Scale with Z equal to X and Y. With a non-uniform scale, Nanite displacement on a landscape
+/// follows the unscaled normal and pushes slopes sideways (UE-367789). The heightmap then fills
+/// only `height_fraction` of the 16-bit range, in steps of `xy / 128` cm.
+pub fn landscape_scale_uniform(
+    size: usize,
+    world_m: f64,
+    height_m: f64,
+) -> Result<LandscapeScale, String> {
+    let xy = world_m * 100.0 / (size.max(2) - 1) as f64;
+    if height_fraction(xy, height_m) > 1.0 {
+        return Err(format!(
+            "{height_m} m of relief does not fit a uniform scale of {xy:.4}: the 16-bit range \
+             covers {:.1} m at that scale. Export with \"uniform_scale\": false, or with fewer \
+             vertices",
+            xy * 5.12
+        ));
+    }
+    Ok(LandscapeScale {
+        xy,
+        z: xy,
+        location_z: 256.0 * xy,
+    })
+}
+
+/// Fraction of the 16-bit range that `height_m` metres of relief take at landscape scale Z `z`.
+pub fn height_fraction(z: f64, height_m: f64) -> f64 {
+    height_m * 100.0 / 512.0 / z
+}
+
 /// What an export wrote and how to import it.
 #[derive(Serialize)]
 pub struct ExportManifest {
@@ -209,6 +238,8 @@ pub struct ExportManifest {
     pub metres_per_vertex: f64,
     pub layouts: Vec<LandscapeLayout>,
     pub scale: LandscapeScale,
+    /// Z scale equals X/Y scale; the heightmap then uses part of the 16-bit range.
+    pub uniform_scale: bool,
     pub tiles_per_side: usize,
     pub heightmaps: Vec<String>,
     pub masks: Vec<MaskExport>,
@@ -308,5 +339,35 @@ mod tests {
         // 600 m over the 512 m Unreal maps at scale 100
         assert!((scale.z - 117.1875).abs() < 1e-9);
         assert!((scale.location_z - 30000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn uniform_scale_keeps_world_heights() {
+        // The 512 m Jezero patch: 1009 vertices over 511.5 m, 59.42 m of relief.
+        let scale = landscape_scale_uniform(1009, 511.5, 59.42).unwrap();
+        assert!((scale.xy - 50.744).abs() < 0.001);
+        assert_eq!(scale.z, scale.xy);
+        assert!((scale.location_z - 256.0 * scale.xy).abs() < 1e-9);
+        let fraction = height_fraction(scale.z, 59.42);
+        assert!((fraction - 0.2287).abs() < 0.0001);
+        // The highest sample, written as 16 bits and read back the way Unreal does, lands on the
+        // relief within one height step.
+        let top = (fraction * f64::from(u16::MAX)).round();
+        let world_cm = top * scale.z / 128.0;
+        assert!((world_cm - 5942.0).abs() < scale.z / 128.0);
+    }
+
+    #[test]
+    fn uniform_scale_fits_the_8km_jezero_window() {
+        let scale = landscape_scale_uniform(8161, 8192.0, 483.64).unwrap();
+        assert!((scale.xy - 100.392).abs() < 0.001);
+        assert!(height_fraction(scale.z, 483.64) < 1.0);
+    }
+
+    #[test]
+    fn uniform_scale_refuses_relief_that_does_not_fit() {
+        // At 50.744 cm per vertex the 16-bit range covers about 259.8 m.
+        let err = landscape_scale_uniform(1009, 511.5, 300.0).unwrap_err();
+        assert!(err.contains("259.8"), "{err}");
     }
 }
