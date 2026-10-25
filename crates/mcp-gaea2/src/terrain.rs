@@ -17,6 +17,10 @@ pub struct Heightfield {
     /// Raw range before normalisation, for reporting.
     pub raw_min: f64,
     pub raw_max: f64,
+    /// Largest value the file format can hold (65535 for 16-bit, 255 for 8-bit). Masks are read
+    /// against this rather than against their own range, so a mask that never reaches full
+    /// coverage is not stretched into one that does.
+    pub full_scale: f64,
 }
 
 /// How the terrain reads against what a map needs.
@@ -68,13 +72,14 @@ pub fn load(path: &Path) -> Result<Heightfield, String> {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    let values: Vec<f64> = match extension.as_str() {
+    let (values, full_scale): (Vec<f64>, f64) = match extension.as_str() {
         "raw" | "r16" => {
             let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {path:?}: {e}"))?;
-            bytes
+            let values = bytes
                 .chunks_exact(2)
                 .map(|pair| f64::from(u16::from_le_bytes([pair[0], pair[1]])))
-                .collect()
+                .collect();
+            (values, f64::from(u16::MAX))
         },
         "png" => read_png(path)?,
         other => {
@@ -110,10 +115,11 @@ pub fn load(path: &Path) -> Result<Heightfield, String> {
         samples,
         raw_min,
         raw_max,
+        full_scale,
     })
 }
 
-fn read_png(path: &Path) -> Result<Vec<f64>, String> {
+fn read_png(path: &Path) -> Result<(Vec<f64>, f64), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Cannot read {path:?}: {e}"))?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Gaea writes its PNG8 outputs with a palette, so the samples only become readable once the
@@ -143,18 +149,34 @@ fn read_png(path: &Path) -> Result<Vec<f64>, String> {
     // Only the first channel carries height; the rest is colour or alpha.
     let data = &buffer[..info.buffer_size()];
     let values = match info.bit_depth {
-        png::BitDepth::Sixteen => data
-            .chunks_exact(2 * channels)
-            .map(|px| f64::from(u16::from_be_bytes([px[0], px[1]])))
-            .collect(),
-        png::BitDepth::Eight => data
-            .chunks_exact(channels)
-            .map(|px| f64::from(px[0]))
-            .collect(),
+        png::BitDepth::Sixteen => (
+            data.chunks_exact(2 * channels)
+                .map(|px| f64::from(u16::from_be_bytes([px[0], px[1]])))
+                .collect(),
+            f64::from(u16::MAX),
+        ),
+        png::BitDepth::Eight => (
+            data.chunks_exact(channels)
+                .map(|px| f64::from(px[0]))
+                .collect(),
+            f64::from(u8::MAX),
+        ),
         depth => return Err(format!("Unsupported bit depth {depth:?}")),
     };
 
     Ok(values)
+}
+
+impl Heightfield {
+    /// Samples as a share of what the file format can hold, without stretching to the field's
+    /// own range. This is what a mask means: 0.4 coverage stays 0.4.
+    pub fn absolute(&self) -> Vec<f64> {
+        let span = self.raw_max - self.raw_min;
+        self.samples
+            .iter()
+            .map(|s| ((self.raw_min + s * span) / self.full_scale).clamp(0.0, 1.0))
+            .collect()
+    }
 }
 
 impl Heightfield {
@@ -311,6 +333,7 @@ mod tests {
             samples,
             raw_min: 0.0,
             raw_max: 1.0,
+            full_scale: 1.0,
         }
     }
 

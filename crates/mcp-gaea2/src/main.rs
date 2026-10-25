@@ -32,6 +32,7 @@ mod server;
 mod templates;
 mod terrain;
 mod types;
+mod unreal;
 mod validation;
 
 use server::Gaea2Server;

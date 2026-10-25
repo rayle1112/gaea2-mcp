@@ -81,6 +81,7 @@ impl Gaea2Server {
             Arc::new(NodeInfoTool { refs: refs.clone() }),
             Arc::new(AnalyzeBuildTool),
             Arc::new(AnalyzeTerrainTool),
+            Arc::new(ExportUnrealTool),
             Arc::new(SetSaveDefinitionTool),
             Arc::new(PatchProjectTool),
             Arc::new(CalibrateNodesTool { refs }),
@@ -2545,6 +2546,283 @@ impl Tool for AnalyzeTerrainTool {
         value["shape"] = json!(shape);
 
         ToolResult::json(&value)
+    }
+}
+
+// =============================================================================
+// Tool: export_gaea2_for_unreal
+// =============================================================================
+
+/// Gaea builds at powers of two; Unreal landscapes take `quads * sections * components + 1`
+/// vertices. This bridges the two and writes down the scale, so an import lands at the intended
+/// size in metres instead of whatever the importer guesses.
+struct ExportUnrealTool;
+
+#[async_trait]
+impl Tool for ExportUnrealTool {
+    fn name(&self) -> &str {
+        "export_gaea2_for_unreal"
+    }
+
+    fn description(&self) -> &str {
+        "Turn a built heightfield (and optional masks) into an Unreal landscape import set: \
+         resamples to a size Unreal accepts (8129, 8161, 4033...; nearest valid size by default), \
+         writes 16-bit PNG and/or .r16 heightmaps, 8-bit layer masks at the same size, optional \
+         tiles named _x0_y0 for tiled import, and unreal_import.json with the landscape scale \
+         (XY cm per vertex, Z for the height range, actor Z that puts the lowest point at 0) and \
+         the component layouts that match."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "heightmap_path": {
+                    "type": "string",
+                    "description": "Heightfield written by a build: 16-bit .png, .raw or .r16"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory for the import set (created if missing)"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Base file name, e.g. 'Moon_8km'",
+                    "default": "Landscape"
+                },
+                "world_size_m": {
+                    "type": "number",
+                    "description": "Width of the landscape in metres, edge to edge"
+                },
+                "height_range_m": {
+                    "type": "number",
+                    "description": "Metres between the lowest and highest sample of the heightmap"
+                },
+                "target_size": {
+                    "type": "integer",
+                    "description": "Vertices per side. Must be a size Unreal accepts; omitted, the \
+                                    accepted size nearest the source resolution is used. Presets: \
+                                    8129 (127x2x32), 8161 (255x1x32), 4033 (63x2x32)"
+                },
+                "tiles_per_side": {
+                    "type": "integer",
+                    "description": "Split into N x N tiles that share edges (for World Partition \
+                                    tiled import); 1 writes a single file",
+                    "default": 1
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["png", "r16", "both"],
+                    "default": "png"
+                },
+                "masks": {
+                    "type": "array",
+                    "description": "Masks to resample alongside, written as 8-bit layer weights",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "name": {"type": "string", "description": "Layer name, e.g. 'Slope'"},
+                            "normalize": {
+                                "type": "boolean",
+                                "description": "Stretch the mask to its own min..max. Simulation \
+                                                outputs such as Thermal2 Wear/Deposits often \
+                                                use a sliver of the 16-bit range and would \
+                                                otherwise import as an empty layer",
+                                "default": false
+                            }
+                        },
+                        "required": ["path", "name"]
+                    }
+                }
+            },
+            "required": ["heightmap_path", "output_dir", "world_size_m", "height_range_m"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let text = |key: &str| args.get(key).and_then(Value::as_str);
+        let heightmap = text("heightmap_path")
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'heightmap_path'".to_string()))?
+            .to_string();
+        let output_dir = PathBuf::from(
+            text("output_dir")
+                .ok_or_else(|| MCPError::InvalidParameters("Missing 'output_dir'".to_string()))?,
+        );
+        let name = text("name").unwrap_or("Landscape").to_string();
+        let format = text("format").unwrap_or("png").to_string();
+        let world_m = args
+            .get("world_size_m")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'world_size_m'".to_string()))?;
+        let height_m = args
+            .get("height_range_m")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'height_range_m'".to_string()))?;
+        let tiles = args
+            .get("tiles_per_side")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
+        let requested = args.get("target_size").and_then(Value::as_u64).map(|v| v as usize);
+        let masks: Vec<(String, String, bool)> = args
+            .get("masks")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|m| {
+                        Some((
+                            m.get("path")?.as_str()?.to_string(),
+                            m.get("name")?.as_str()?.to_string(),
+                            m.get("normalize").and_then(Value::as_bool).unwrap_or(false),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !["png", "r16", "both"].contains(&format.as_str()) {
+            return Err(MCPError::InvalidParameters(format!(
+                "format must be png, r16 or both, not '{format}'"
+            )));
+        }
+
+        // Resampling 8K fields is seconds of CPU; keep it off the async threads.
+        let manifest = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+            use crate::unreal::*;
+
+            let field = crate::terrain::load(std::path::Path::new(&heightmap))?;
+            if field.raw_max <= field.raw_min {
+                return Err("The heightmap is flat; there is nothing to import".to_string());
+            }
+            let target = requested.unwrap_or_else(|| nearest_valid_size(field.size));
+            let layouts = layouts_for(target);
+            if layouts.is_empty() {
+                return Err(format!(
+                    "{target} is not a size Unreal accepts; the nearest is {}",
+                    nearest_valid_size(target)
+                ));
+            }
+            std::fs::create_dir_all(&output_dir)
+                .map_err(|e| format!("Cannot create {}: {e}", output_dir.display()))?;
+
+            let height = resample(&field.samples, field.size, target);
+            let mut heightmaps = Vec::new();
+            if format != "r16" {
+                heightmaps.extend(write_field(
+                    &output_dir, &name, &height, target, tiles, &write_png16, "png",
+                )?);
+            }
+            if format != "png" {
+                heightmaps.extend(write_field(
+                    &output_dir,
+                    &name,
+                    &height,
+                    target,
+                    tiles,
+                    &|path: &std::path::Path, samples: &[f64], _: usize| write_r16(path, samples),
+                    "r16",
+                )?);
+            }
+
+            let mut mask_exports = Vec::new();
+            let mut faint = Vec::new();
+            for (path, layer, normalize) in &masks {
+                let mask = crate::terrain::load(std::path::Path::new(path))?;
+                let values = if *normalize {
+                    mask.samples.clone()
+                } else {
+                    mask.absolute()
+                };
+                let resampled = resample(&values, mask.size, target);
+                let mean = resampled.iter().sum::<f64>() / resampled.len() as f64;
+                if mean < 0.01 && !normalize {
+                    faint.push(layer.clone());
+                }
+                let files = write_field(
+                    &output_dir,
+                    &format!("{name}_{layer}"),
+                    &resampled,
+                    target,
+                    tiles,
+                    &write_png8,
+                    "png",
+                )?;
+                mask_exports.push(MaskExport {
+                    name: layer.clone(),
+                    source: path.clone(),
+                    files,
+                    mean: (mean * 1000.0).round() / 1000.0,
+                });
+            }
+
+            let scale = landscape_scale(target, world_m, height_m);
+            let mut notes = vec![
+                format!(
+                    "Landscape mode > Import from File: pick the heightmap, set Section Size {} \
+                     quads, {} section(s) per component, {} components per side.",
+                    layouts[0].quads_per_section,
+                    layouts[0].sections_per_component,
+                    layouts[0].components_per_side
+                ),
+                format!(
+                    "Set the landscape scale to X={:.4} Y={:.4} Z={:.4} and location Z={:.1} cm \
+                     so the lowest point sits at 0.",
+                    scale.xy, scale.xy, scale.z, scale.location_z
+                ),
+                "Import each mask as the weight of the paint layer it is named after.".to_string(),
+            ];
+            if field.size != target {
+                notes.push(format!(
+                    "Resampled from {} to {}: the build size is a power of two, which Unreal \
+                     would otherwise pad or crop.",
+                    field.size, target
+                ));
+            }
+            if !faint.is_empty() {
+                notes.push(format!(
+                    "Mask(s) {} cover under 1% on average and will paint almost nothing; the \
+                     node writes them in a small part of the 16-bit range. Export again with \
+                     \"normalize\": true, or put an Autolevel after the node in Gaea.",
+                    faint.join(", ")
+                ));
+            }
+            if tiles > 1 {
+                notes.push(
+                    "Tiles share their border vertex; import them with the tiled heightmap \
+                     option, which reads the _x#_y# suffix."
+                        .to_string(),
+                );
+            }
+
+            let manifest = ExportManifest {
+                name: name.clone(),
+                source: heightmap.clone(),
+                source_resolution: field.size,
+                resolution: target,
+                world_size_m: world_m,
+                height_range_m: height_m,
+                metres_per_vertex: world_m / (target - 1) as f64,
+                layouts,
+                scale,
+                tiles_per_side: tiles,
+                heightmaps,
+                masks: mask_exports,
+                import_notes: notes,
+            };
+            let manifest_path = output_dir.join("unreal_import.json");
+            let text = serde_json::to_string_pretty(&manifest)
+                .map_err(|e| format!("Cannot serialise the manifest: {e}"))?;
+            std::fs::write(&manifest_path, text)
+                .map_err(|e| format!("Cannot write {}: {e}", manifest_path.display()))?;
+            Ok(manifest)
+        })
+        .await
+        .map_err(|e| MCPError::Internal(format!("Export task failed: {e}")))?
+        .map_err(MCPError::ToolExecutionFailed)?;
+
+        ToolResult::json(&manifest)
     }
 }
 
